@@ -1,24 +1,24 @@
 package executors
 
 import (
-	"Shared/shared_models"
+	"context"
 	"os/exec"
+	"time"
+
+	"Shared/shared_models"
 )
 
-func ExecuteScriptStage(stage shared_models.OperationRequest) shared_models.OperationResponse {
+func ExecuteScriptStage(ctx context.Context, stage shared_models.OperationRequest) shared_models.OperationResponse {
+	runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
 
-	pythonScript := stage.Script
-
-	cmd := exec.Command("python3", "-c", pythonScript)
+	cmd := exec.CommandContext(runCtx, "python3", "-c", stage.Script)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return shared_models.OperationResponse{
-			WorkflowId: stage.WorkflowId,
-			StageId:    stage.StageId,
-			StageType:  stage.StageType,
-			Status:     "FAILURE",
-			Error:      err.Error(),
+		if runCtx.Err() == context.DeadlineExceeded {
+			return failureResponse(stage, "script execution timed out after 5 minutes")
 		}
+		return failureResponse(stage, err.Error())
 	}
 
 	return shared_models.OperationResponse{
@@ -26,8 +26,8 @@ func ExecuteScriptStage(stage shared_models.OperationRequest) shared_models.Oper
 		WorkflowId:     stage.WorkflowId,
 		StageId:        stage.StageId,
 		StageType:      stage.StageType,
+		Attempt:        stage.Attempt,
 		Status:         "SUCCESS",
 		ScriptResponse: string(output),
 	}
-
 }

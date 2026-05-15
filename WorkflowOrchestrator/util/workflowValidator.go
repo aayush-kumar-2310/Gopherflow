@@ -7,34 +7,36 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+var allowedOperations = map[string]bool{
+	"EXECUTE_SCRIPT": true,
+	"FETCH_SFTP":     true,
+	"UPLOAD_SFTP":    true,
+	"HTTP_REQUEST":   true,
+	"LLM":            true,
+}
+
 func ValidateWorkflow(workflow models.Workflow) bool {
-	if workflow.WorkflowName == "" {
-		return false
-	} else if workflow.WorkflowId == "" {
-		return false
-	} else if workflow.CronExpression == "" {
-		return false
-	}
-	return true
+	return workflow.WorkflowName != "" &&
+		workflow.WorkflowId != "" &&
+		workflow.CronExpression != ""
 }
 
 func ValidateStage(stage models.Stage) bool {
-	if stage.StageId == "" {
+	if stage.StageId == "" || stage.WorkflowId == "" || stage.Operation == "" {
 		return false
-	} else if stage.WorkflowId == "" {
+	}
+	if !allowedOperations[stage.Operation] {
 		return false
-	} else if stage.Operation == "" {
+	}
+	if stage.Weight < 1 || stage.Weight > 5 {
 		return false
 	}
 	return true
 }
 
 func ValidateDependencyGraph(c *gin.Context, workflow models.Workflow) bool {
-	// We capture both the boolean and the error string here
 	hasLoop, errMsg := checkDependencyLoop(workflow)
-
 	if hasLoop {
-		// Now you can actually tell the user WHY it failed
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMsg})
 		return false
 	}
@@ -45,12 +47,10 @@ func checkDependencyLoop(workflow models.Workflow) (bool, string) {
 	graph := make(map[string][]string)
 	allStageIds := make(map[string]bool)
 
-	// 1. Map all IDs for O(1) existence check
 	for _, s := range workflow.Stages {
-		allStageIds[s.StageId] = true // Just assign, no need for _
+		allStageIds[s.StageId] = true
 	}
 
-	// 2. Build graph and check for "Ghost" dependencies
 	for _, stage := range workflow.Stages {
 		for _, dep := range stage.DependentOn {
 			if !allStageIds[dep] {
@@ -64,7 +64,6 @@ func checkDependencyLoop(workflow models.Workflow) (bool, string) {
 	recStack := make(map[string]bool)
 	var errorMsg string
 
-	// 3. DFS Closure
 	var dfs func(string) bool
 	dfs = func(node string) bool {
 		if recStack[node] {
@@ -74,10 +73,8 @@ func checkDependencyLoop(workflow models.Workflow) (bool, string) {
 		if visited[node] {
 			return false
 		}
-
 		visited[node] = true
 		recStack[node] = true
-
 		for _, neighbor := range graph[node] {
 			if dfs(neighbor) {
 				return true

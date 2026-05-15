@@ -1,174 +1,112 @@
-# Workflow Orchestration Engine
+# Gopherflow
 
-A distributed, event-driven workflow orchestration system for scheduling and executing multi-stage data pipelines. Supports Python script execution, SFTP/S3 file operations, and LangChain-powered summarisation and report generation.
+A two-service, event-driven workflow orchestration system in Go. Schedules multi-stage pipelines with cron, DAG dependencies, weighted execution, retries, and run history in PostgreSQL.
 
 ## Architecture
 
-Three independent microservices communicating via Kafka, with Redis as the scheduling and state backbone and PostgreSQL as the persistent store.
-
 ```
-┌─────────────────────────────────────────────────────┐
-│                      VPC                            │
-│                                                     │
-│   ┌──────────────────┐    Kafka topics              │
-│   │   Orchestrator   │──────────────────────────┐  │
-│   │   (Go)           │  stage.execute.script     │  │
-│   │                  │  stage.execute.langchain   │  │
-│   │  - HTTP API      │  stage.file               │  │
-│   │  - Cron scheduler│◄─────────────────────────┐│  │
-│   │  - DAG evaluator │  stage.result             ││  │
-│   │  - Result handler│                           ││  │
-│   └────────┬─────────┘                           ││  │
-│            │                                     ││  │
-│   ┌────────▼──────────┐   ┌─────────────────┐   ││  │
-│   │      Redis        │   │  Executor svc   │───┘│  │
-│   │                   │   │  (Python)       │    │  │
-│   │  workflow-trigger │   │                 │    │  │
-│   │  stage-queue      │   │  EXECUTE_SCRIPT │    │  │
-│   │  pending:{id}     │   │  SUMMARIZE      │    │  │
-│   │  dependents:{id}  │   │  GENERATE_REPORT│    │  │
-│   │  state:{wf}:{run} │   └─────────────────┘    │  │
-│   │  seen:{jobId}     │                          │  │
-│   │  lock:{jobId}     │   ┌─────────────────┐    │  │
-│   │  cache:stages:{wf}│   │  File service   │────┘  │
-│   └───────────────────┘   │  (Go)           │       │
-│                           │                 │       │
-│   ┌───────────────────┐   │  FETCH/UPLOAD   │       │
-│   │    PostgreSQL     │   │  SFTP and S3    │       │
-│   │  workflows+stages │   └─────────────────┘       │
-│   └───────────────────┘                             │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  WorkflowOrchestrator (Go)                                  │
+│  - POST /createWorkflow, GET /workflows, GET /runs          │
+│  - Cron → Redis workflow-trigger                            │
+│  - DAG counters + weighted job-trigger queue                │
+│  - Kafka producer (execute-stage) / consumer (responses)    │
+│  - Redis stage status → PostgreSQL on run complete          │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ Kafka
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Event_Handler (Go)                                         │
+│  - EXECUTE_SCRIPT, FETCH_SFTP, UPLOAD_SFTP                  │
+│  - HTTP_REQUEST, LLM (Ollama)                               │
+└─────────────────────────────────────────────────────────────┘
+
+        Redis (scheduling + live state)    PostgreSQL (definitions + history)
 ```
 
-## Key Design Decisions
+## Supported stage types
 
-### DAG dependency engine
-Every stage carries a `dependsOn: []string` field. At workflow creation the orchestrator validates the graph with DFS cycle detection and builds two Redis structures:
+| `operation` | Description |
+|-------------|-------------|
+| `EXECUTE_SCRIPT` | Run inline Python via `python3 -c` |
+| `FETCH_SFTP` | Download remote file |
+| `UPLOAD_SFTP` | Upload local file |
+| `HTTP_REQUEST` | Call an HTTP API |
+| `LLM` | Send a prompt to Ollama (use for summarisation, reports, etc.) |
 
-- `dependents:{stageId}` — a Redis SET of stages to notify when this stage completes (forward map inverted at creation time)
-- `pending:{workflowId}:{runId}:{stageId}` — an atomic counter initialised to `len(dependsOn)`
+Each stage has `weight` (1–5). Higher weight is scheduled sooner in the weighted `job-trigger` queue.
 
-When a stage completes, the orchestrator calls `SMEMBERS dependents:{stageId}`, then `DECR` on each child's pending counter. Any counter that hits zero is pushed directly to `stage-queue` with `score = now`. No DB scan, no LIKE query on JSON arrays.
+## Retry behaviour
 
-### Dual ZSET scheduler
-Two sorted sets serve fundamentally different purposes:
+- Up to **3 attempts** per stage (`MaxStageAttempts`).
+- On failure: Redis status `FAILED-RETRY`, then re-queued with the same weight.
+- After exhaustion: `FAILED-EXHAUSTED`, dependents are `SKIPPED`, run becomes `PARTIAL_FAILURE`.
+- Kafka result dedup via `seen:{workflowId}:{runId}:{stageId}:{attempt}`.
 
-| ZSET | Score | Purpose |
-|------|-------|---------|
-| `workflow-trigger` | Next cron Unix timestamp | Wakes up a workflow on schedule |
-| `stage-queue` | `time.Now().Unix()` | Holds stages ready to execute |
+## Redis keys (runtime)
 
-The poller reads `workflow-trigger` to fire workflows, fetches stage details from DB (with Redis read-through cache), and pushes initial stages (those with `dependsOn: []`) to `stage-queue`. All subsequent stages are pushed directly by the result handler — not by the poller.
+| Key | Purpose |
+|-----|---------|
+| `workflow-trigger` | Cron schedule (ZSET) |
+| `job-trigger` | Weighted ready stages (ZSET) |
+| `stage-status:{wf}:{run}:{stage}` | PENDING / RUNNING / FIN / FAILED-* / SKIPPED |
+| `deps:{wf}:{stage}:{run}` | Remaining parent count |
+| `children:{wf}:{parent}:{run}` | Downstream stage IDs |
+| `output:{wf}:{stage}:{run}` | Stage result for dependents |
+| `attempt:{wf}:{run}:{stage}` | Current attempt number |
+| `run:total` / `run:done` | Progress toward finalization |
 
-### Deduplication
-Kafka delivers at-least-once. Before acting on any result message the orchestrator runs:
+## PostgreSQL
 
-```
-SET seen:{workflowId}:{stageId}:{retryN}  1  NX  EX 86400
-```
+| Table | Purpose |
+|-------|---------|
+| `workflows` / `stages` | Definitions |
+| `workflow_runs` | One row per cron execution |
+| `stage_executions` | Final per-stage outcome (flushed when run completes) |
 
-If the key already exists, the message is a redelivery and is dropped before any state mutation.
+## API
 
-### Distributed lock
-Before a worker executes a stage it acquires:
+- `POST /createWorkflow` — create workflow + schedule cron
+- `GET /workflows` — list definitions
+- `GET /runs?workflowId=` — run history
+- `GET /runs/:runId/stages` — stage outcomes for a run
 
-```
-SET lock:{jobId}  {workerId}  NX  PX {ttl_ms}
-```
+## Configuration
 
-Release uses a Lua check-and-delete to prevent a stale worker from releasing a lock it no longer owns.
+Copy `.env.example` to `.env` (or edit the repo `.env`) and set Postgres, Redis, Kafka, and optional SMTP values. Both services load `.env` on startup via `Shared/config`.
 
-### Read-through cache
-Stage definitions are immutable after creation. On cron fire the orchestrator checks `cache:stages:{workflowId}` before hitting the DB, reducing query load under concurrent same-schedule workflows. TTL is 1 hour.
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `POSTGRES_DSN` | local gopherflow | GORM database |
+| `REDIS_ADDR` | `localhost:6379` | Scheduling + live state |
+| `KAFKA_BROKERS` | `localhost:9092` | Comma-separated brokers |
+| `WORKER_POOL_SIZE` | `8` | Max concurrent stage/workflow workers per service |
+| `SMTP_ENABLED` | `false` | Email on retry exhaustion |
+| `SMTP_TO` | — | Recipient for failure alerts |
+| `KAFKA_DLQ_TOPIC` | `stage-dlq` | Dead-letter topic for exhausted failures |
+| `ORCHESTRATOR_METRICS_PORT` | `9091` | Orchestrator `/metrics` |
+| `EVENT_HANDLER_METRICS_PORT` | `9094` | Executor `/metrics` (do not use 9092 — that is Kafka) |
+| `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | Structured `slog` logging |
+| `KAFKA_READ_TIMEOUT_SEC` | `5` | Kafka poll timeout (avoids blocking forever) |
+| `SHUTDOWN_TIMEOUT_SEC` | `15` | Graceful shutdown budget |
 
-## Stage schema
+Create the DLQ topic in Kafka: `stage-dlq`. Metrics: `curl localhost:9091/metrics`.
 
-```json
-{
-  "stageId": "fetch-source",
-  "workflowId": "wf-abc123",
-  "jobType": "FETCH_SFTP",
-  "dependsOn": [],
-  "weight": 1,
-  "uploadTarget": { "host": "sftp.example.com", "path": "/data/in" },
-  "script": "",
-  "prompt": ""
-}
-```
-
-Supported `jobType` values: `EXECUTE_SCRIPT`, `FETCH_SFTP`, `UPLOAD_SFTP`, `FETCH_S3`, `UPLOAD_S3`, `SUMMARIZE`, `GENERATE_REPORT`
-
-## Services
-
-### Orchestrator (Go)
-- `POST /createWorkflow` — validate, persist to DB, build Redis dependency structures
-- `GET /workflows` — list all workflows
-- Redis poller goroutine — fires cron-scheduled workflows and dispatches ready stages
-- Kafka consumer — handles `stage.result` topic, runs DAG evaluation on each completion
-
-### Executor service (Python)
-- Kafka consumer on `stage.execute.script` and `stage.execute.langchain`
-- Runs Python scripts in subprocess with isolated execution
-- LangChain integration for summarisation and report generation
-- Publishes to `stage.result` on completion or failure
-
-### File service (Go)
-- Kafka consumer on `stage.file`
-- SFTP client for fetch and upload operations
-- AWS SDK S3 client for fetch and upload operations
-- Publishes to `stage.result` on completion or failure
-
-## Retry and failure
-
-- Each stage retries up to 3 times. `jobId` is scoped as `{workflowId}:{stageId}:{retryN}`
-- On exhaustion, `workflowId` and `stageId` are pushed to a Kafka DLQ
-- User is notified via SMTP on failure
-- Stages with `dependsOn` referencing a failed stage remain unscheduled; the workflow is marked `PARTIAL_FAILURE` in the DB
-
-## Redis key inventory
-
-| Key pattern | Type | Purpose |
-|-------------|------|---------|
-| `workflow-trigger` | ZSET | Cron schedule queue |
-| `stage-queue` | ZSET | Ready-to-execute stages |
-| `lock:{jobId}` | STRING | Distributed execution lock |
-| `dependents:{stageId}` | SET | Forward notification map |
-| `pending:{wfId}:{runId}:{stageId}` | STRING | Atomic unblock counter |
-| `state:{workflowId}:{runId}` | STRING | Live workflow state (JSON) |
-| `seen:{jobId}` | STRING | Kafka dedup guard |
-| `cache:stages:{workflowId}` | STRING | DB read-through cache |
-
-## Tech stack
-
-| Layer | Technology |
-|-------|-----------|
-| Orchestrator | Go, Gin, GORM, go-redis, robfig/cron |
-| Executor | Python, LangChain, confluent-kafka-python |
-| File service | Go, AWS SDK v2, pkg/sftp |
-| Message broker | Apache Kafka |
-| Cache / scheduler | Redis |
-| Database | PostgreSQL |
-| Auth | JWT (planned) |
-
-## Getting started
+## Run locally
 
 ```bash
-# Clone the repo
-git clone https://github.com/yourusername/workflow-orchestrator
+# Infrastructure (Redis, Kafka, Postgres) must be running.
+# .env lives at repo root; config loads it from cwd or parent folders.
 
-# Start infrastructure
-docker-compose up -d redis kafka postgres
+cd /path/to/Gopherflow
+go run ./WorkflowOrchestrator
 
-# Run orchestrator
-cd orchestrator && go run main.go
-
-# Run executor service
-cd executor && pip install -r requirements.txt && python main.py
-
-# Run file service
-cd file-service && go run main.go
+# second terminal
+EVENT_HANDLER_METRICS_PORT=9094 go run ./Event_Handler
 ```
+
+Or from a service folder: `cd WorkflowOrchestrator && go run .` (still finds `../.env`).
 
 ## Status
 
-Active development. Core orchestrator (HTTP API, cron scheduler, DAG validation, Redis scheduling) is functional. DB persistence layer, Kafka integration, executor service, and file service are in progress.
+Two-service MVP: orchestration, DAG, weighted queue, retries, stage status in Redis, and run history persistence are implemented. SMTP/DLQ, REST Kafka fallback, and auth are not yet included.

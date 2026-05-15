@@ -1,10 +1,17 @@
 package consumer
 
-import "github.com/segmentio/kafka-go"
+import (
+	"Shared/config"
 
-func InitKafkaConsumer() *kafka.Reader {
+	"github.com/segmentio/kafka-go"
+)
+
+func InitKafkaConsumer(cfg config.Config) *kafka.Reader {
 	return kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"localhost:9092"},
-		Topic:   "execute-stage",
+		Brokers:  cfg.KafkaBrokers,
+		Topic:    cfg.KafkaExecuteTopic,
+		GroupID:  "event-handler-workers",
+		MinBytes: 1,
+		MaxBytes: 10e6,
 	})
 }
